@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { IPv4, IPv6 } from 'ip-num/IPNumber'
 import type { NodeInfo, PeerRoutePair } from '~/types/network'
 
 const props = defineProps<{
@@ -131,8 +132,16 @@ const myNodeInfoChips = computed(() => {
   if (!my_node_info)
     return chips
 
-  // virtual ipv4
+  // TUN Device Name
+  const dev_name = curNetworkInst.value.detail?.dev_name
+  if (dev_name) {
+    chips.push({
+      label: `TUN Device Name: ${dev_name}`,
+      icon: '',
+    } as Chip)
+  }
 
+  // virtual ipv4
   chips.push({
     label: `Virtual IPv4: ${my_node_info.virtual_ipv4}`,
     icon: '',
@@ -142,7 +151,7 @@ const myNodeInfoChips = computed(() => {
   const local_ipv4s = my_node_info.ips?.interface_ipv4s
   for (const [idx, ip] of local_ipv4s?.entries()) {
     chips.push({
-      label: `Local IPv4 ${idx}: ${ip}`,
+      label: `Local IPv4 ${idx}: ${IPv4.fromNumber(ip.addr)}`,
       icon: '',
     } as Chip)
   }
@@ -151,7 +160,11 @@ const myNodeInfoChips = computed(() => {
   const local_ipv6s = my_node_info.ips?.interface_ipv6s
   for (const [idx, ip] of local_ipv6s?.entries()) {
     chips.push({
-      label: `Local IPv6 ${idx}: ${ip}`,
+      label: `Local IPv6 ${idx}: ${IPv6.fromBigInt((BigInt(ip.part1) << BigInt(96))
+        + (BigInt(ip.part2) << BigInt(64))
+        + (BigInt(ip.part3) << BigInt(32))
+        + BigInt(ip.part4),
+      )}`,
       icon: '',
     } as Chip)
   }
@@ -160,7 +173,19 @@ const myNodeInfoChips = computed(() => {
   const public_ip = my_node_info.ips?.public_ipv4
   if (public_ip) {
     chips.push({
-      label: `Public IP: ${public_ip}`,
+      label: `Public IP: ${IPv4.fromNumber(public_ip.addr)}`,
+      icon: '',
+    } as Chip)
+  }
+
+  const public_ipv6 = my_node_info.ips?.public_ipv6
+  if (public_ipv6) {
+    chips.push({
+      label: `Public IPv6: ${IPv6.fromBigInt((BigInt(public_ipv6.part1) << BigInt(96))
+        + (BigInt(public_ipv6.part2) << BigInt(64))
+        + (BigInt(public_ipv6.part3) << BigInt(32))
+        + BigInt(public_ipv6.part4),
+      )}`,
       icon: '',
     } as Chip)
   }

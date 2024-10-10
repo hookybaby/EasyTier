@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
+use tokio::task::JoinSet;
 
 use crate::{
     common::{error::Error, PeerId},
@@ -26,6 +27,8 @@ pub struct PeerRpcManager {
     tspt: Arc<Box<dyn PeerRpcManagerTransport>>,
     rpc_client: rpc_impl::client::Client,
     rpc_server: rpc_impl::server::Server,
+
+    tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl std::fmt::Debug for PeerRpcManager {
@@ -42,6 +45,8 @@ impl PeerRpcManager {
             tspt: Arc::new(Box::new(tspt)),
             rpc_client: rpc_impl::client::Client::new(),
             rpc_server: rpc_impl::server::Server::new(),
+
+            tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
 
@@ -60,7 +65,7 @@ impl PeerRpcManager {
 
         let tspt = self.tspt.clone();
 
-        tokio::spawn(async move {
+        self.tasks.lock().unwrap().spawn(async move {
             loop {
                 let packet = tokio::select! {
                     Some(Ok(packet)) = server_rx.next() => {
@@ -85,7 +90,7 @@ impl PeerRpcManager {
         });
 
         let tspt = self.tspt.clone();
-        tokio::spawn(async move {
+        self.tasks.lock().unwrap().spawn(async move {
             loop {
                 let Ok(o) = tspt.recv().await else {
                     tracing::warn!("peer rpc transport read aborted, exiting");
@@ -117,6 +122,12 @@ impl PeerRpcManager {
     }
 }
 
+impl Drop for PeerRpcManager {
+    fn drop(&mut self) {
+        tracing::debug!("PeerRpcManager drop, my_peer_id: {:?}", self.my_peer_id());
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use std::{pin::Pin, sync::Arc};
@@ -135,8 +146,8 @@ pub mod tests {
             tests::{GreetingClientFactory, GreetingServer, GreetingService, SayHelloRequest},
         },
         tunnel::{
-            packet_def::ZCPacket, ring::create_ring_tunnel_pair, Tunnel,
-            ZCPacketSink, ZCPacketStream,
+            packet_def::ZCPacket, ring::create_ring_tunnel_pair, Tunnel, ZCPacketSink,
+            ZCPacketStream,
         },
     };
 
@@ -213,7 +224,10 @@ pub mod tests {
 
         let msg = random_string(8192);
         let ret = stub
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await
             .unwrap();
 
@@ -222,7 +236,10 @@ pub mod tests {
 
         let msg = random_string(10);
         let ret = stub
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await
             .unwrap();
 
@@ -270,7 +287,10 @@ pub mod tests {
             );
 
         let ret = stub
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await
             .unwrap();
         assert_eq!(ret.greeting, format!("Hello {}!", msg));
@@ -278,14 +298,20 @@ pub mod tests {
         // call again
         let msg = random_string(16 * 1024);
         let ret = stub
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await
             .unwrap();
         assert_eq!(ret.greeting, format!("Hello {}!", msg));
 
         let msg = random_string(16 * 1024);
         let ret = stub
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await
             .unwrap();
         assert_eq!(ret.greeting, format!("Hello {}!", msg));
@@ -329,13 +355,19 @@ pub mod tests {
 
         let msg = random_string(16 * 1024);
         let ret = stub1
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await
             .unwrap();
         assert_eq!(ret.greeting, format!("Hello {}!", msg));
 
         let ret = stub2
-            .say_hello(RpcController {}, SayHelloRequest { name: msg.clone() })
+            .say_hello(
+                RpcController::default(),
+                SayHelloRequest { name: msg.clone() },
+            )
             .await;
         assert!(ret.is_err() && ret.unwrap_err().to_string().contains("Timeout"));
     }

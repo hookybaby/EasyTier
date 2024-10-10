@@ -55,6 +55,12 @@ if ! command -v unzip >/dev/null 2>&1; then
   exit 1
 fi
 
+# check if curl is installed
+if ! command -v curl >/dev/null 2>&1; then
+  echo -e "\r\n${RED_COLOR}Error: curl is not installed${RES}\r\n"
+  exit 1
+fi
+
 echo -e "\r\n${RED_COLOR}----------------------NOTICE----------------------${RES}\r\n"
 echo " This is a temporary script to install EasyTier "
 echo " EasyTier requires a dedicated empty folder to install"
@@ -112,7 +118,7 @@ elif [ "$ARCH" == "UNKNOWN" ]; then
   echo -e "\r\n${RED_COLOR}Opus${RES}, this script do not support your platfrom\r\nTry ${GREEN_COLOR}install by band${RES}\r\n"
   exit 1
 elif ! command -v systemctl >/dev/null 2>&1; then
-  echo -e "\r\n${RED_COLOR}Opus${RES}, your Linux do not support systemctl\r\nnTry ${GREEN_COLOR}install by band${RES}\r\n"
+  echo -e "\r\n${RED_COLOR}Opus${RES}, your Linux do not support systemctl\r\nTry ${GREEN_COLOR}install by band${RES}\r\n"
   exit 1
 fi
 

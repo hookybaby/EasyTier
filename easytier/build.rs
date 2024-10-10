@@ -46,8 +46,8 @@ impl WindowsBuild {
 
     fn download_protoc() -> PathBuf {
         println!("cargo:info=use exist protoc: {:?}", "k");
-        let out_dir = Self::get_cargo_target_dir().unwrap();
-        let fname = out_dir.join("protoc");
+        let out_dir = Self::get_cargo_target_dir().unwrap().join("protobuf");
+        let fname = out_dir.join("bin/protoc.exe");
         if fname.exists() {
             println!("cargo:info=use exist protoc: {:?}", fname);
             return fname;
@@ -65,10 +65,7 @@ impl WindowsBuild {
             .map(zip::ZipArchive::new)
             .unwrap()
             .unwrap();
-        let protoc_zipped_file = content.by_name("bin/protoc.exe").unwrap();
-        let mut content = protoc_zipped_file;
-
-        copy(&mut content, &mut File::create(&fname).unwrap()).unwrap();
+        content.extract(out_dir).unwrap();
 
         fname
     }
@@ -151,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .type_attribute("peer_rpc.DirectConnectedPeerInfo", "#[derive(Hash)]")
         .type_attribute("peer_rpc.PeerInfoForGlobalMap", "#[derive(Hash)]")
+        .type_attribute("peer_rpc.ForeignNetworkRouteInfoKey", "#[derive(Hash, Eq)]")
         .type_attribute("common.RpcDescriptor", "#[derive(Hash, Eq)]")
         .service_generator(Box::new(rpc_build::ServiceGenerator::new()))
         .btree_map(&["."])

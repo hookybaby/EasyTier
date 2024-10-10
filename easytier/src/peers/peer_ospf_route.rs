@@ -6,9 +6,10 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Weak,
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
+use crossbeam::atomic::AtomicCell;
 use dashmap::DashMap;
 use petgraph::{
     algo::{all_simple_paths, astar, dijkstra},
@@ -24,27 +25,30 @@ use tokio::{
 
 use crate::{
     common::{
-        constants::EASYTIER_VERSION, global_ctx::ArcGlobalCtx, stun::StunInfoCollectorTrait, PeerId,
+        config::NetworkIdentity, constants::EASYTIER_VERSION, global_ctx::ArcGlobalCtx,
+        stun::StunInfoCollectorTrait, PeerId,
     },
     peers::route_trait::{Route, RouteInterfaceBox},
     proto::{
-        common::{NatType, StunInfo},
+        common::{Ipv4Inet, NatType, StunInfo},
         peer_rpc::{
+            route_foreign_network_infos, ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey,
             OspfRouteRpc, OspfRouteRpcClientFactory, OspfRouteRpcServer, PeerIdVersion,
-            RoutePeerInfo, RoutePeerInfos, SyncRouteInfoError, SyncRouteInfoRequest,
-            SyncRouteInfoResponse,
+            RouteForeignNetworkInfos, RoutePeerInfo, RoutePeerInfos, SyncRouteInfoError,
+            SyncRouteInfoRequest, SyncRouteInfoResponse,
         },
         rpc_types::{
             self,
             controller::{BaseController, Controller},
         },
     },
+    use_global_var,
 };
 
 use super::{
     peer_rpc::PeerRpcManager,
     route_trait::{
-        DefaultRouteCostCalculator, NextHopPolicy, RouteCostCalculator,
+        DefaultRouteCostCalculator, ForeignNetworkRouteInfoMap, NextHopPolicy, RouteCostCalculator,
         RouteCostCalculatorInterface,
     },
     PeerPacketFilter,
@@ -89,6 +93,16 @@ impl From<Version> for AtomicVersion {
     }
 }
 
+fn is_foreign_network_info_newer(
+    next: &ForeignNetworkRouteInfoEntry,
+    prev: &ForeignNetworkRouteInfoEntry,
+) -> Option<bool> {
+    Some(
+        SystemTime::try_from(next.last_update?).ok()?
+            > SystemTime::try_from(prev.last_update?).ok()?,
+    )
+}
+
 impl RoutePeerInfo {
     pub fn new() -> Self {
         Self {
@@ -102,15 +116,23 @@ impl RoutePeerInfo {
             last_update: Some(SystemTime::now().into()),
             version: 0,
             easytier_version: EASYTIER_VERSION.to_string(),
+            feature_flag: None,
+            peer_route_id: 0,
+            network_length: 24,
         }
     }
 
-    pub fn update_self(&self, my_peer_id: PeerId, global_ctx: &ArcGlobalCtx) -> Self {
+    pub fn update_self(
+        &self,
+        my_peer_id: PeerId,
+        peer_route_id: u64,
+        global_ctx: &ArcGlobalCtx,
+    ) -> Self {
         let mut new = Self {
             peer_id: my_peer_id,
             inst_id: Some(global_ctx.get_id().into()),
             cost: 0,
-            ipv4_addr: global_ctx.get_ipv4().map(|x| x.into()),
+            ipv4_addr: global_ctx.get_ipv4().map(|x| x.address().into()),
             proxy_cidrs: global_ctx
                 .get_proxy_cidrs()
                 .iter()
@@ -127,6 +149,12 @@ impl RoutePeerInfo {
             version: self.version,
 
             easytier_version: EASYTIER_VERSION.to_string(),
+            feature_flag: Some(global_ctx.get_feature_flags()),
+            peer_route_id,
+            network_length: global_ctx
+                .get_ipv4()
+                .map(|x| x.network_length() as u32)
+                .unwrap_or(24),
         };
 
         let need_update_periodically = if let Ok(Ok(d)) =
@@ -148,12 +176,21 @@ impl RoutePeerInfo {
 
 impl Into<crate::proto::cli::Route> for RoutePeerInfo {
     fn into(self) -> crate::proto::cli::Route {
+        let network_length = if self.network_length == 0 {
+            24
+        } else {
+            self.network_length
+        };
+
         crate::proto::cli::Route {
             peer_id: self.peer_id,
             ipv4_addr: if let Some(ipv4_addr) = self.ipv4_addr {
-                ipv4_addr.to_string()
+                Some(Ipv4Inet {
+                    address: Some(ipv4_addr.into()),
+                    network_length,
+                })
             } else {
-                "".to_string()
+                None
             },
             next_hop_peer_id: 0,
             cost: self.cost as i32,
@@ -168,6 +205,7 @@ impl Into<crate::proto::cli::Route> for RoutePeerInfo {
             },
             inst_id: self.inst_id.map(|x| x.to_string()).unwrap_or_default(),
             version: self.easytier_version,
+            feature_flag: self.feature_flag,
         }
     }
 }
@@ -240,6 +278,7 @@ type Error = SyncRouteInfoError;
 struct SyncedRouteInfo {
     peer_infos: DashMap<PeerId, RoutePeerInfo>,
     conn_map: DashMap<PeerId, (BTreeSet<PeerId>, AtomicVersion)>,
+    foreign_network: DashMap<ForeignNetworkRouteInfoKey, ForeignNetworkRouteInfoEntry>,
 }
 
 impl SyncedRouteInfo {
@@ -253,6 +292,7 @@ impl SyncedRouteInfo {
         tracing::warn!(?peer_id, "remove_peer from synced_route_info");
         self.peer_infos.remove(&peer_id);
         self.conn_map.remove(&peer_id);
+        self.foreign_network.retain(|k, _| k.peer_id != peer_id);
     }
 
     fn fill_empty_peer_info(&self, peer_ids: &BTreeSet<PeerId>) {
@@ -277,38 +317,57 @@ impl SyncedRouteInfo {
     fn check_duplicate_peer_id(
         &self,
         my_peer_id: PeerId,
+        my_peer_route_id: u64,
         dst_peer_id: PeerId,
-        route_infos: &Vec<RoutePeerInfo>,
+        dst_peer_route_id: Option<u64>,
+        info: &RoutePeerInfo,
     ) -> Result<(), Error> {
         // 1. check if we are duplicated.
-        for info in route_infos.iter() {
-            if info.peer_id == my_peer_id {
-                if info.version > self.get_peer_info_version_with_default(info.peer_id) {
-                    // if dst peer send to us with higher version info of my peer, our peer id is duplicated
-                    // TODO: handle this better. restart peer manager?
-                    panic!("my peer id is duplicated");
-                    // return Err(Error::DuplicatePeerId);
-                }
+        if info.peer_id == my_peer_id {
+            if info.peer_route_id != my_peer_route_id
+                && info.version > self.get_peer_info_version_with_default(info.peer_id)
+            {
+                // if dst peer send to us with higher version info of my peer, our peer id is duplicated
+                // TODO: handle this better. restart peer manager?
+                panic!("my peer id is duplicated");
+                // return Err(Error::DuplicatePeerId);
             }
+        } else if info.peer_id == dst_peer_id {
+            let Some(dst_peer_route_id) = dst_peer_route_id else {
+                return Ok(());
+            };
 
-            if info.peer_id == dst_peer_id {
-                if info.version < self.get_peer_info_version_with_default(info.peer_id) {
-                    // if dst peer send to us with lower version info of dst peer, dst peer id is duplicated
-                    return Err(Error::DuplicatePeerId);
-                }
+            if dst_peer_route_id != info.peer_route_id
+                && info.version < self.get_peer_info_version_with_default(info.peer_id)
+            {
+                // if dst peer send to us with lower version info of dst peer, dst peer id is duplicated
+                return Err(Error::DuplicatePeerId);
             }
         }
+
         Ok(())
     }
 
     fn update_peer_infos(
         &self,
         my_peer_id: PeerId,
+        my_peer_route_id: u64,
         dst_peer_id: PeerId,
         peer_infos: &Vec<RoutePeerInfo>,
     ) -> Result<(), Error> {
-        self.check_duplicate_peer_id(my_peer_id, dst_peer_id, peer_infos)?;
         for mut route_info in peer_infos.iter().map(Clone::clone) {
+            self.check_duplicate_peer_id(
+                my_peer_id,
+                my_peer_route_id,
+                dst_peer_id,
+                if route_info.peer_id == dst_peer_id {
+                    self.peer_infos.get(&dst_peer_id).map(|x| x.peer_route_id)
+                } else {
+                    None
+                },
+                &route_info,
+            )?;
+
             // time between peers may not be synchronized, so update last_update to local now.
             // note only last_update with larger version will be updated to local saved peer info.
             route_info.last_update = Some(SystemTime::now().into());
@@ -350,12 +409,39 @@ impl SyncedRouteInfo {
         }
     }
 
-    fn update_my_peer_info(&self, my_peer_id: PeerId, global_ctx: &ArcGlobalCtx) -> bool {
+    fn update_foreign_network(&self, foreign_network: &RouteForeignNetworkInfos) {
+        for item in foreign_network.infos.iter().map(Clone::clone) {
+            let Some(key) = item.key else {
+                continue;
+            };
+            let Some(mut entry) = item.value else {
+                continue;
+            };
+
+            entry.last_update = Some(SystemTime::now().into());
+
+            self.foreign_network
+                .entry(key.clone())
+                .and_modify(|old_entry| {
+                    if entry.version > old_entry.version {
+                        *old_entry = entry.clone();
+                    }
+                })
+                .or_insert_with(|| entry.clone());
+        }
+    }
+
+    fn update_my_peer_info(
+        &self,
+        my_peer_id: PeerId,
+        my_peer_route_id: u64,
+        global_ctx: &ArcGlobalCtx,
+    ) -> bool {
         let mut old = self
             .peer_infos
             .entry(my_peer_id)
             .or_insert(RoutePeerInfo::new());
-        let new = old.update_self(my_peer_id, &global_ctx);
+        let new = old.update_self(my_peer_id, my_peer_route_id, &global_ctx);
         let new_version = new.version;
         let old_version = old.version;
         *old = new;
@@ -378,6 +464,63 @@ impl SyncedRouteInfo {
             my_conn_info.value().1.inc();
             true
         }
+    }
+
+    fn update_my_foreign_network(
+        &self,
+        my_peer_id: PeerId,
+        foreign_networks: ForeignNetworkRouteInfoMap,
+    ) -> bool {
+        let now = SystemTime::now();
+        let now_version = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as Version;
+        let mut updated = false;
+        for mut item in self
+            .foreign_network
+            .iter_mut()
+            .filter(|x| x.key().peer_id == my_peer_id)
+        {
+            let (key, entry) = item.pair_mut();
+            if let Some(mut new_entry) = foreign_networks.get_mut(key) {
+                assert!(!new_entry.foreign_peer_ids.is_empty());
+                if let Some(is_newer) = is_foreign_network_info_newer(&new_entry, entry) {
+                    let need_renew = is_newer
+                        || now
+                            .duration_since(entry.last_update.unwrap().try_into().unwrap())
+                            .unwrap()
+                            > UPDATE_PEER_INFO_PERIOD;
+                    if need_renew {
+                        new_entry.version = std::cmp::max(new_entry.version + 1, now_version);
+                        *entry = new_entry.clone();
+                        updated = true;
+                    }
+                }
+                drop(new_entry);
+                foreign_networks.remove(key).unwrap();
+            } else if !item.foreign_peer_ids.is_empty() {
+                item.foreign_peer_ids.clear();
+                item.last_update = Some(SystemTime::now().into());
+                item.version = std::cmp::max(item.version + 1, now_version);
+                updated = true;
+            }
+        }
+
+        for item in foreign_networks.iter() {
+            assert!(!item.value().foreign_peer_ids.is_empty());
+            self.foreign_network
+                .entry(item.key().clone())
+                .and_modify(|v| panic!("key should not exist, {:?}", v))
+                .or_insert_with(|| {
+                    let mut v = item.value().clone();
+                    v.version = now_version;
+                    v
+                });
+            updated = true;
+        }
+
+        updated
     }
 
     fn is_peer_bidirectly_connected(&self, src_peer_id: PeerId, dst_peer_id: PeerId) -> bool {
@@ -427,7 +570,7 @@ impl RouteTable {
     fn get_nat_type(&self, peer_id: PeerId) -> Option<NatType> {
         self.peer_infos
             .get(&peer_id)
-            .map(|x| NatType::try_from(x.udp_stun_info as i32).unwrap())
+            .map(|x| NatType::try_from(x.udp_stun_info as i32).unwrap_or_default())
     }
 
     fn build_peer_graph_from_synced_info<T: RouteCostCalculatorInterface>(
@@ -620,12 +763,14 @@ type SessionId = u64;
 type AtomicSessionId = atomic_shim::AtomicU64;
 
 struct SessionTask {
+    my_peer_id: PeerId,
     task: Arc<std::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl SessionTask {
-    fn new() -> Self {
+    fn new(my_peer_id: PeerId) -> Self {
         SessionTask {
+            my_peer_id,
             task: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -650,6 +795,7 @@ impl Drop for SessionTask {
         if let Some(task) = self.task.lock().unwrap().take() {
             task.abort();
         }
+        tracing::debug!(my_peer_id = self.my_peer_id, "drop SessionTask");
     }
 }
 
@@ -664,9 +810,11 @@ impl Debug for SessionTask {
 // if we need to sync route info with one peer, we create a SyncRouteSession with that peer.
 #[derive(Debug)]
 struct SyncRouteSession {
+    my_peer_id: PeerId,
     dst_peer_id: PeerId,
     dst_saved_peer_info_versions: DashMap<PeerId, AtomicVersion>,
     dst_saved_conn_bitmap_version: DashMap<PeerId, AtomicVersion>,
+    dst_saved_foreign_network_versions: DashMap<ForeignNetworkRouteInfoKey, AtomicVersion>,
 
     my_session_id: AtomicSessionId,
     dst_session_id: AtomicSessionId,
@@ -684,11 +832,13 @@ struct SyncRouteSession {
 }
 
 impl SyncRouteSession {
-    fn new(dst_peer_id: PeerId) -> Self {
+    fn new(my_peer_id: PeerId, dst_peer_id: PeerId) -> Self {
         SyncRouteSession {
+            my_peer_id,
             dst_peer_id,
             dst_saved_peer_info_versions: DashMap::new(),
             dst_saved_conn_bitmap_version: DashMap::new(),
+            dst_saved_foreign_network_versions: DashMap::new(),
 
             my_session_id: AtomicSessionId::new(rand::random()),
             dst_session_id: AtomicSessionId::new(0),
@@ -701,7 +851,7 @@ impl SyncRouteSession {
             rpc_tx_count: AtomicU32::new(0),
             rpc_rx_count: AtomicU32::new(0),
 
-            task: SessionTask::new(),
+            task: SessionTask::new(my_peer_id),
         }
     }
 
@@ -734,6 +884,15 @@ impl SyncRouteSession {
         }
     }
 
+    fn update_dst_saved_foreign_network_version(&self, foreign_network: &RouteForeignNetworkInfos) {
+        for item in foreign_network.infos.iter() {
+            self.dst_saved_foreign_network_versions
+                .entry(item.key.clone().unwrap())
+                .or_insert_with(|| AtomicVersion::new())
+                .set_if_larger(item.value.as_ref().unwrap().version);
+        }
+    }
+
     fn update_initiator_flag(&self, is_initiator: bool) {
         self.we_are_initiator.store(is_initiator, Ordering::Relaxed);
         self.need_sync_initiator_info.store(true, Ordering::Relaxed);
@@ -763,28 +922,41 @@ impl SyncRouteSession {
     }
 }
 
+impl Drop for SyncRouteSession {
+    fn drop(&mut self) {
+        tracing::debug!(?self, "drop SyncRouteSession");
+    }
+}
+
 struct PeerRouteServiceImpl {
     my_peer_id: PeerId,
+    my_peer_route_id: u64,
     global_ctx: ArcGlobalCtx,
     sessions: DashMap<PeerId, Arc<SyncRouteSession>>,
 
-    interface: Arc<Mutex<Option<RouteInterfaceBox>>>,
+    interface: Mutex<Option<RouteInterfaceBox>>,
 
-    cost_calculator: Arc<std::sync::Mutex<Option<RouteCostCalculator>>>,
+    cost_calculator: std::sync::Mutex<Option<RouteCostCalculator>>,
     route_table: RouteTable,
     route_table_with_cost: RouteTable,
-    synced_route_info: Arc<SyncedRouteInfo>,
+    foreign_network_owner_map: DashMap<NetworkIdentity, Vec<PeerId>>,
+    synced_route_info: SyncedRouteInfo,
     cached_local_conn_map: std::sync::Mutex<RouteConnBitmap>,
+
+    last_update_my_foreign_network: AtomicCell<Option<std::time::Instant>>,
 }
 
 impl Debug for PeerRouteServiceImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerRouteServiceImpl")
             .field("my_peer_id", &self.my_peer_id)
+            .field("my_peer_route_id", &self.my_peer_route_id)
+            .field("network", &self.global_ctx.get_network_identity())
             .field("sessions", &self.sessions)
             .field("route_table", &self.route_table)
             .field("route_table_with_cost", &self.route_table_with_cost)
             .field("synced_route_info", &self.synced_route_info)
+            .field("foreign_network_owner_map", &self.foreign_network_owner_map)
             .field(
                 "cached_local_conn_map",
                 &self.cached_local_conn_map.lock().unwrap(),
@@ -797,30 +969,33 @@ impl PeerRouteServiceImpl {
     fn new(my_peer_id: PeerId, global_ctx: ArcGlobalCtx) -> Self {
         PeerRouteServiceImpl {
             my_peer_id,
+            my_peer_route_id: rand::random(),
             global_ctx,
             sessions: DashMap::new(),
 
-            interface: Arc::new(Mutex::new(None)),
+            interface: Mutex::new(None),
 
-            cost_calculator: Arc::new(std::sync::Mutex::new(Some(Box::new(
-                DefaultRouteCostCalculator,
-            )))),
+            cost_calculator: std::sync::Mutex::new(Some(Box::new(DefaultRouteCostCalculator))),
 
             route_table: RouteTable::new(),
             route_table_with_cost: RouteTable::new(),
+            foreign_network_owner_map: DashMap::new(),
 
-            synced_route_info: Arc::new(SyncedRouteInfo {
+            synced_route_info: SyncedRouteInfo {
                 peer_infos: DashMap::new(),
                 conn_map: DashMap::new(),
-            }),
+                foreign_network: DashMap::new(),
+            },
             cached_local_conn_map: std::sync::Mutex::new(RouteConnBitmap::new()),
+
+            last_update_my_foreign_network: AtomicCell::new(None),
         }
     }
 
     fn get_or_create_session(&self, dst_peer_id: PeerId) -> Arc<SyncRouteSession> {
         self.sessions
             .entry(dst_peer_id)
-            .or_insert_with(|| Arc::new(SyncRouteSession::new(dst_peer_id)))
+            .or_insert_with(|| Arc::new(SyncRouteSession::new(self.my_peer_id, dst_peer_id)))
             .value()
             .clone()
     }
@@ -850,10 +1025,11 @@ impl PeerRouteServiceImpl {
     }
 
     fn update_my_peer_info(&self) -> bool {
-        if self
-            .synced_route_info
-            .update_my_peer_info(self.my_peer_id, &self.global_ctx)
-        {
+        if self.synced_route_info.update_my_peer_info(
+            self.my_peer_id,
+            self.my_peer_route_id,
+            &self.global_ctx,
+        ) {
             self.update_route_table_and_cached_local_conn_bitmap();
             return true;
         }
@@ -869,6 +1045,36 @@ impl PeerRouteServiceImpl {
         if updated {
             self.update_route_table_and_cached_local_conn_bitmap();
         }
+
+        updated
+    }
+
+    async fn update_my_foreign_network(&self) -> bool {
+        let last_time = self.last_update_my_foreign_network.load();
+        if last_time.is_some()
+            && last_time.unwrap().elapsed().as_secs()
+                < use_global_var!(OSPF_UPDATE_MY_GLOBAL_FOREIGN_NETWORK_INTERVAL_SEC)
+        {
+            return false;
+        }
+
+        self.last_update_my_foreign_network
+            .store(Some(std::time::Instant::now()));
+
+        let foreign_networks = self
+            .interface
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .list_foreign_networks()
+            .await;
+
+        let updated = self
+            .synced_route_info
+            .update_my_foreign_network(self.my_peer_id, foreign_networks);
+
+        // do not need update owner map because we always filter out my peer id.
 
         updated
     }
@@ -891,6 +1097,35 @@ impl PeerRouteServiceImpl {
             calc_locked.as_mut().unwrap(),
         );
         calc_locked.as_mut().unwrap().end_update();
+    }
+
+    fn update_foreign_network_owner_map(&self) {
+        self.foreign_network_owner_map.clear();
+        for item in self.synced_route_info.foreign_network.iter() {
+            let key = item.key();
+            let entry = item.value();
+            if key.peer_id == self.my_peer_id
+                || !self.route_table.peer_reachable(key.peer_id)
+                || entry.foreign_peer_ids.is_empty()
+            {
+                continue;
+            }
+            let network_identity = NetworkIdentity {
+                network_name: key.network_name.clone(),
+                network_secret: None,
+                network_secret_digest: Some(
+                    entry
+                        .network_secret_digest
+                        .clone()
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+            };
+            self.foreign_network_owner_map
+                .entry(network_identity)
+                .or_insert_with(|| Vec::new())
+                .push(key.peer_id);
+        }
     }
 
     fn cost_calculator_need_update(&self) -> bool {
@@ -988,20 +1223,59 @@ impl PeerRouteServiceImpl {
         Some(self.cached_local_conn_map.lock().unwrap().clone())
     }
 
+    fn build_foreign_network_info(
+        &self,
+        session: &SyncRouteSession,
+    ) -> Option<RouteForeignNetworkInfos> {
+        let mut foreign_networks = RouteForeignNetworkInfos::default();
+        for item in self.synced_route_info.foreign_network.iter() {
+            if session
+                .dst_saved_foreign_network_versions
+                .get(&item.key())
+                .map(|x| x.get() >= item.value().version)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            foreign_networks
+                .infos
+                .push(route_foreign_network_infos::Info {
+                    key: Some(item.key().clone()),
+                    value: Some(item.value().clone()),
+                });
+        }
+
+        if foreign_networks.infos.is_empty() {
+            None
+        } else {
+            Some(foreign_networks)
+        }
+    }
+
     async fn update_my_infos(&self) -> bool {
-        let mut ret = self.update_my_peer_info();
-        ret |= self.update_my_conn_info().await;
-        ret
+        let my_peer_info_updated = self.update_my_peer_info();
+        let my_conn_info_updated = self.update_my_conn_info().await;
+        let my_foreign_network_updated = self.update_my_foreign_network().await;
+        if my_conn_info_updated || my_peer_info_updated {
+            self.update_foreign_network_owner_map();
+        }
+        my_peer_info_updated || my_conn_info_updated || my_foreign_network_updated
     }
 
     fn build_sync_request(
         &self,
         session: &SyncRouteSession,
-    ) -> (Option<Vec<RoutePeerInfo>>, Option<RouteConnBitmap>) {
+    ) -> (
+        Option<Vec<RoutePeerInfo>>,
+        Option<RouteConnBitmap>,
+        Option<RouteForeignNetworkInfos>,
+    ) {
         let route_infos = self.build_route_info(&session);
         let conn_bitmap = self.build_conn_bitmap(&session);
+        let foreign_network = self.build_foreign_network_info(&session);
 
-        (route_infos, conn_bitmap)
+        (route_infos, conn_bitmap, foreign_network)
     }
 
     fn clear_expired_peer(&self) {
@@ -1019,12 +1293,35 @@ impl PeerRouteServiceImpl {
         for p in to_remove.iter() {
             self.synced_route_info.remove_peer(*p);
         }
+
+        // clear expired foreign network info
+        let mut to_remove = Vec::new();
+        for item in self.synced_route_info.foreign_network.iter() {
+            let Some(since_last_update) = item
+                .value()
+                .last_update
+                .and_then(|x| SystemTime::try_from(x).ok())
+                .and_then(|x| now.duration_since(x).ok())
+            else {
+                to_remove.push(item.key().clone());
+                continue;
+            };
+
+            if since_last_update > REMOVE_DEAD_PEER_INFO_AFTER {
+                to_remove.push(item.key().clone());
+            }
+        }
+
+        for p in to_remove.iter() {
+            self.synced_route_info.foreign_network.remove(p);
+        }
     }
 
     async fn sync_route_with_peer(
         &self,
         dst_peer_id: PeerId,
         peer_rpc: Arc<PeerRpcManager>,
+        sync_as_initiator: bool,
     ) -> bool {
         let Some(session) = self.get_session(dst_peer_id) else {
             // if session not exist, exit the sync loop.
@@ -1033,13 +1330,15 @@ impl PeerRouteServiceImpl {
 
         let my_peer_id = self.my_peer_id;
 
-        let (peer_infos, conn_bitmap) = self.build_sync_request(&session);
-        tracing::info!("building sync_route request. my_id {:?}, pper_id: {:?}, peer_infos: {:?}, conn_bitmap: {:?}, synced_route_info: {:?} session: {:?}",
+        let (peer_infos, conn_bitmap, foreign_network) = self.build_sync_request(&session);
+        tracing::info!(?foreign_network, "building sync_route request. my_id {:?}, pper_id: {:?}, peer_infos: {:?}, conn_bitmap: {:?}, synced_route_info: {:?} session: {:?}",
                        my_peer_id, dst_peer_id, peer_infos, conn_bitmap, self.synced_route_info, session);
 
         if peer_infos.is_none()
             && conn_bitmap.is_none()
+            && foreign_network.is_none()
             && !session.need_sync_initiator_info.load(Ordering::Relaxed)
+            && !(sync_as_initiator && session.we_are_initiator.load(Ordering::Relaxed))
         {
             return true;
         }
@@ -1056,7 +1355,7 @@ impl PeerRouteServiceImpl {
                 self.global_ctx.get_network_name(),
             );
 
-        let mut ctrl = BaseController {};
+        let mut ctrl = BaseController::default();
         ctrl.set_timeout_ms(3000);
         let ret = rpc_stub
             .sync_route_info(
@@ -1067,6 +1366,7 @@ impl PeerRouteServiceImpl {
                     is_initiator: session.we_are_initiator.load(Ordering::Relaxed),
                     peer_infos: peer_infos.clone().map(|x| RoutePeerInfos { items: x }),
                     conn_bitmap: conn_bitmap.clone().map(Into::into),
+                    foreign_network_infos: foreign_network.clone(),
                 },
             )
             .await;
@@ -1110,9 +1410,19 @@ impl PeerRouteServiceImpl {
                 if let Some(conn_bitmap) = &conn_bitmap {
                     session.update_dst_saved_conn_bitmap_version(&conn_bitmap);
                 }
+
+                if let Some(foreign_network) = &foreign_network {
+                    session.update_dst_saved_foreign_network_version(&foreign_network);
+                }
             }
         }
         return false;
+    }
+}
+
+impl Drop for PeerRouteServiceImpl {
+    fn drop(&mut self) {
+        tracing::debug!(?self, "drop PeerRouteServiceImpl");
     }
 }
 
@@ -1145,6 +1455,7 @@ impl OspfRouteRpc for RouteSessionManager {
         let is_initiator = request.is_initiator;
         let peer_infos = request.peer_infos.map(|x| x.items);
         let conn_bitmap = request.conn_bitmap.map(Into::into);
+        let foreign_network = request.foreign_network_infos;
 
         let ret = self
             .do_sync_route_info(
@@ -1153,6 +1464,7 @@ impl OspfRouteRpc for RouteSessionManager {
                 is_initiator,
                 peer_infos,
                 conn_bitmap,
+                foreign_network,
             )
             .await;
 
@@ -1183,30 +1495,56 @@ impl RouteSessionManager {
         dst_peer_id: PeerId,
         mut sync_now: tokio::sync::broadcast::Receiver<()>,
     ) {
+        let mut last_sync = Instant::now();
         loop {
-            let Some(service_impl) = service_impl.upgrade() else {
-                return;
-            };
+            let mut first_time = true;
 
-            let Some(peer_rpc) = peer_rpc.upgrade() else {
-                return;
-            };
+            loop {
+                let Some(service_impl) = service_impl.clone().upgrade() else {
+                    return;
+                };
 
-            while !service_impl
-                .sync_route_with_peer(dst_peer_id, peer_rpc.clone())
-                .await
-            {
+                let Some(peer_rpc) = peer_rpc.clone().upgrade() else {
+                    return;
+                };
+
+                if first_time {
+                    first_time = false;
+                    service_impl.update_my_infos().await;
+                }
+
+                // if we are initiator, we should ensure the dst has the session.
+                let sync_as_initiator = if last_sync.elapsed().as_secs() > 10 {
+                    last_sync = Instant::now();
+                    true
+                } else {
+                    false
+                };
+
+                if service_impl
+                    .sync_route_with_peer(dst_peer_id, peer_rpc.clone(), sync_as_initiator)
+                    .await
+                {
+                    break;
+                }
+
+                drop(service_impl);
+                drop(peer_rpc);
+
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                service_impl.update_my_infos().await;
             }
-            sync_now.resubscribe();
 
-            drop(service_impl);
-            drop(peer_rpc);
+            sync_now = sync_now.resubscribe();
 
             select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                _ = sync_now.recv() => {}
+                ret = sync_now.recv() => match ret {
+                    Err(e) => {
+                        tracing::debug!(?e, "session_task sync_now recv failed, ospf route may exit");
+                        break;
+                    },
+                    _ => {}
+                }
             }
         }
     }
@@ -1220,7 +1558,7 @@ impl RouteSessionManager {
         Ok(())
     }
 
-    fn start_session_task(&self, session: &Arc<SyncRouteSession>) {
+    fn start_session_task(&self, session: &SyncRouteSession) {
         if !session.task.is_running() {
             session.task.set_task(tokio::spawn(Self::session_task(
                 self.peer_rpc.clone(),
@@ -1381,6 +1719,7 @@ impl RouteSessionManager {
         is_initiator: bool,
         peer_infos: Option<Vec<RoutePeerInfo>>,
         conn_bitmap: Option<RouteConnBitmap>,
+        foreign_network: Option<RouteForeignNetworkInfos>,
     ) -> Result<SyncRouteInfoResponse, Error> {
         let Some(service_impl) = self.service_impl.upgrade() else {
             return Err(Error::Stopped);
@@ -1393,21 +1732,39 @@ impl RouteSessionManager {
 
         session.update_dst_session_id(from_session_id);
 
+        let mut need_update_route_table = false;
+
         if let Some(peer_infos) = &peer_infos {
             service_impl.synced_route_info.update_peer_infos(
                 my_peer_id,
+                service_impl.my_peer_route_id,
                 from_peer_id,
                 peer_infos,
             )?;
             session.update_dst_saved_peer_info_version(peer_infos);
+            need_update_route_table = true;
         }
 
         if let Some(conn_bitmap) = &conn_bitmap {
             service_impl.synced_route_info.update_conn_map(&conn_bitmap);
             session.update_dst_saved_conn_bitmap_version(conn_bitmap);
+            need_update_route_table = true;
         }
 
-        service_impl.update_route_table_and_cached_local_conn_bitmap();
+        if need_update_route_table {
+            service_impl.update_route_table_and_cached_local_conn_bitmap();
+        }
+
+        if let Some(foreign_network) = &foreign_network {
+            service_impl
+                .synced_route_info
+                .update_foreign_network(&foreign_network);
+            session.update_dst_saved_foreign_network_version(foreign_network);
+        }
+
+        if need_update_route_table || foreign_network.is_some() {
+            service_impl.update_foreign_network_owner_map();
+        }
 
         tracing::info!(
             "handling sync_route_info rpc: from_peer_id: {:?}, is_initiator: {:?}, peer_infos: {:?}, conn_bitmap: {:?}, synced_route_info: {:?} session: {:?}, new_route_table: {:?}",
@@ -1432,7 +1789,7 @@ impl RouteSessionManager {
 pub struct PeerRoute {
     my_peer_id: PeerId,
     global_ctx: ArcGlobalCtx,
-    peer_rpc: Arc<PeerRpcManager>,
+    peer_rpc: Weak<PeerRpcManager>,
 
     service_impl: Arc<PeerRouteServiceImpl>,
     session_mgr: RouteSessionManager,
@@ -1462,7 +1819,7 @@ impl PeerRoute {
         Arc::new(PeerRoute {
             my_peer_id,
             global_ctx: global_ctx.clone(),
-            peer_rpc,
+            peer_rpc: Arc::downgrade(&peer_rpc),
 
             service_impl,
             session_mgr,
@@ -1514,7 +1871,11 @@ impl PeerRoute {
     }
 
     async fn start(&self) {
-        self.peer_rpc.rpc_server().registry().register(
+        let Some(peer_rpc) = self.peer_rpc.upgrade() else {
+            return;
+        };
+
+        peer_rpc.rpc_server().registry().register(
             OspfRouteRpcServer::new(self.session_mgr.clone()),
             &self.global_ctx.get_network_name(),
         );
@@ -1544,7 +1905,18 @@ impl PeerRoute {
 
 impl Drop for PeerRoute {
     fn drop(&mut self) {
-        self.peer_rpc.rpc_server().registry().unregister(
+        tracing::debug!(
+            self.my_peer_id,
+            network = ?self.global_ctx.get_network_identity(),
+            service = ?self.service_impl,
+            "PeerRoute drop"
+        );
+
+        let Some(peer_rpc) = self.peer_rpc.upgrade() else {
+            return;
+        };
+
+        peer_rpc.rpc_server().registry().unregister(
             OspfRouteRpcServer::new(self.session_mgr.clone()),
             &self.global_ctx.get_network_name(),
         );
@@ -1618,6 +1990,38 @@ impl Route for PeerRoute {
 
     async fn dump(&self) -> String {
         format!("{:#?}", self)
+    }
+
+    async fn list_foreign_network_info(&self) -> RouteForeignNetworkInfos {
+        let route_table = &self.service_impl.route_table;
+        let mut foreign_networks = RouteForeignNetworkInfos::default();
+        for item in self
+            .service_impl
+            .synced_route_info
+            .foreign_network
+            .iter()
+            .filter(|x| !x.value().foreign_peer_ids.is_empty())
+            .filter(|x| route_table.peer_reachable(x.key().peer_id))
+        {
+            foreign_networks
+                .infos
+                .push(route_foreign_network_infos::Info {
+                    key: Some(item.key().clone()),
+                    value: Some(item.value().clone()),
+                });
+        }
+        foreign_networks
+    }
+
+    async fn list_peers_own_foreign_network(
+        &self,
+        network_identity: &NetworkIdentity,
+    ) -> Vec<PeerId> {
+        self.service_impl
+            .foreign_network_owner_map
+            .get(network_identity)
+            .map(|x| x.clone())
+            .unwrap_or_default()
     }
 }
 

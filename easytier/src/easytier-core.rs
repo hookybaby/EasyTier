@@ -286,13 +286,18 @@ struct Cli {
         help = t!("core_clap.socks5").to_string()
     )]
     socks5: Option<u16>,
+
+    #[arg(
+        long,
+        help = t!("core_clap.ipv6_listener").to_string()
+    )]
+    ipv6_listener: Option<String>,
 }
 
 rust_i18n::i18n!("locales", fallback = "en");
 
 impl Cli {
     fn parse_listeners(no_listener: bool, listeners: Vec<String>) -> Vec<String> {
-        println!("parsing listeners: {:?}", listeners);
         let proto_port_offset = vec![("tcp", 0), ("udp", 0), ("wg", 1), ("ws", 1), ("wss", 2)];
 
         if no_listener || listeners.is_empty() {
@@ -375,7 +380,6 @@ impl From<Cli> for TomlConfigLoader {
         }
 
         let cfg = TomlConfigLoader::default();
-
 
         cfg.set_hostname(cli.hostname);
 
@@ -514,6 +518,12 @@ impl From<Cli> for TomlConfigLoader {
         }
         f.disable_p2p = cli.disable_p2p;
         f.relay_all_peer_rpc = cli.relay_all_peer_rpc;
+        if let Some(ipv6_listener) = cli.ipv6_listener {
+            f.ipv6_listener = ipv6_listener
+                .parse()
+                .with_context(|| format!("failed to parse ipv6 listener: {}", ipv6_listener))
+                .unwrap();
+        }
         cfg.set_flags(f);
 
         cfg.set_exit_nodes(cli.exit_nodes.clone());

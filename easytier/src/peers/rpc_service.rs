@@ -3,8 +3,9 @@ use std::sync::Arc;
 use crate::proto::{
     cli::{
         DumpRouteRequest, DumpRouteResponse, ListForeignNetworkRequest, ListForeignNetworkResponse,
-        ListPeerRequest, ListPeerResponse, ListRouteRequest, ListRouteResponse, PeerInfo,
-        PeerManageRpc, ShowNodeInfoRequest, ShowNodeInfoResponse,
+        ListGlobalForeignNetworkRequest, ListGlobalForeignNetworkResponse, ListPeerRequest,
+        ListPeerResponse, ListRouteRequest, ListRouteResponse, PeerInfo, PeerManageRpc,
+        ShowNodeInfoRequest, ShowNodeInfoResponse,
     },
     rpc_types::{self, controller::BaseController},
 };
@@ -22,13 +23,29 @@ impl PeerManagerRpcService {
     }
 
     pub async fn list_peers(&self) -> Vec<PeerInfo> {
-        let peers = self.peer_manager.get_peer_map().list_peers().await;
+        let mut peers = self.peer_manager.get_peer_map().list_peers().await;
+        peers.extend(
+            self.peer_manager
+                .get_foreign_network_client()
+                .get_peer_map()
+                .list_peers()
+                .await
+                .iter(),
+        );
         let mut peer_infos = Vec::new();
         for peer in peers {
             let mut peer_info = PeerInfo::default();
             peer_info.peer_id = peer;
 
             if let Some(conns) = self.peer_manager.get_peer_map().list_peer_conns(peer).await {
+                peer_info.conns = conns;
+            } else if let Some(conns) = self
+                .peer_manager
+                .get_foreign_network_client()
+                .get_peer_map()
+                .list_peer_conns(peer)
+                .await
+            {
                 peer_info.conns = conns;
             }
 
@@ -88,6 +105,14 @@ impl PeerManageRpc for PeerManagerRpcService {
             .list_foreign_networks()
             .await;
         Ok(reply)
+    }
+
+    async fn list_global_foreign_network(
+        &self,
+        _: BaseController,
+        _request: ListGlobalForeignNetworkRequest,
+    ) -> Result<ListGlobalForeignNetworkResponse, rpc_types::error::Error> {
+        Ok(self.peer_manager.list_global_foreign_network().await)
     }
 
     async fn show_node_info(

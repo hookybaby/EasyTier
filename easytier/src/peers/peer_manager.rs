@@ -2,12 +2,13 @@ use std::{
     fmt::Debug,
     net::Ipv4Addr,
     sync::{Arc, Weak},
+    time::SystemTime,
 };
 
 use anyhow::Context;
 use async_trait::async_trait;
 
-use futures::StreamExt;
+use dashmap::DashMap;
 
 use tokio::{
     sync::{
@@ -16,20 +17,28 @@ use tokio::{
     },
     task::JoinSet,
 };
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     common::{
-        constants::EASYTIER_VERSION, error::Error, global_ctx::ArcGlobalCtx,
-        stun::StunInfoCollectorTrait, PeerId,
+        constants::EASYTIER_VERSION,
+        error::Error,
+        global_ctx::{ArcGlobalCtx, NetworkIdentity},
+        stun::StunInfoCollectorTrait,
+        PeerId,
     },
     peers::{
         peer_conn::PeerConn,
         peer_rpc::PeerRpcManagerTransport,
-        route_trait::{NextHopPolicy, RouteInterface},
+        route_trait::{ForeignNetworkRouteInfoMap, NextHopPolicy, RouteInterface},
         PeerPacketFilter,
     },
-    proto::cli,
+    proto::{
+        cli::{
+            self, list_global_foreign_network_response::OneForeignNetwork,
+            ListGlobalForeignNetworkResponse,
+        },
+        peer_rpc::{ForeignNetworkRouteInfoEntry, ForeignNetworkRouteInfoKey},
+    },
     tunnel::{
         self,
         packet_def::{PacketType, ZCPacket},
@@ -40,7 +49,7 @@ use crate::{
 use super::{
     encrypt::{Encryptor, NullCipher},
     foreign_network_client::ForeignNetworkClient,
-    foreign_network_manager::ForeignNetworkManager,
+    foreign_network_manager::{ForeignNetworkManager, GlobalForeignNetworkAccessor},
     peer_conn::PeerConnId,
     peer_map::PeerMap,
     peer_ospf_route::PeerRoute,
@@ -176,7 +185,7 @@ impl PeerManager {
     ) -> Self {
         let my_peer_id = rand::random();
 
-        let (packet_send, packet_recv) = mpsc::channel(100);
+        let (packet_send, packet_recv) = mpsc::channel(128);
         let peers = Arc::new(PeerMap::new(
             packet_send.clone(),
             global_ctx.clone(),
@@ -228,6 +237,7 @@ impl PeerManager {
             my_peer_id,
             global_ctx.clone(),
             packet_send.clone(),
+            Self::build_foreign_network_manager_accessor(&peers),
         ));
         let foreign_network_client = Arc::new(ForeignNetworkClient::new(
             global_ctx.clone(),
@@ -264,6 +274,34 @@ impl PeerManager {
             encryptor,
             exit_nodes,
         }
+    }
+
+    fn build_foreign_network_manager_accessor(
+        peer_map: &Arc<PeerMap>,
+    ) -> Box<dyn GlobalForeignNetworkAccessor> {
+        struct T {
+            peer_map: Weak<PeerMap>,
+        }
+
+        #[async_trait::async_trait]
+        impl GlobalForeignNetworkAccessor for T {
+            async fn list_global_foreign_peer(
+                &self,
+                network_identity: &NetworkIdentity,
+            ) -> Vec<PeerId> {
+                let Some(peer_map) = self.peer_map.upgrade() else {
+                    return vec![];
+                };
+
+                peer_map
+                    .list_peers_own_foreign_network(network_identity)
+                    .await
+            }
+        }
+
+        Box::new(T {
+            peer_map: Arc::downgrade(peer_map),
+        })
     }
 
     async fn add_new_peer_conn(&self, peer_conn: PeerConn) -> Result<(), Error> {
@@ -321,20 +359,85 @@ impl PeerManager {
         Ok(())
     }
 
+    async fn try_handle_foreign_network_packet(
+        packet: ZCPacket,
+        my_peer_id: PeerId,
+        peer_map: &PeerMap,
+        foreign_network_mgr: &ForeignNetworkManager,
+    ) -> Result<(), ZCPacket> {
+        let pm_header = packet.peer_manager_header().unwrap();
+        if pm_header.packet_type != PacketType::ForeignNetworkPacket as u8 {
+            return Err(packet);
+        }
+
+        let from_peer_id = pm_header.from_peer_id.get();
+        let to_peer_id = pm_header.to_peer_id.get();
+
+        let foreign_hdr = packet.foreign_network_hdr().unwrap();
+        let foreign_network_name = foreign_hdr.get_network_name(packet.payload());
+        let foreign_peer_id = foreign_hdr.get_dst_peer_id();
+
+        if to_peer_id == my_peer_id {
+            // packet sent from other peer to me, extract the inner packet and forward it
+            if let Err(e) = foreign_network_mgr
+                .send_msg_to_peer(
+                    &foreign_network_name,
+                    foreign_peer_id,
+                    packet.foreign_network_packet(),
+                )
+                .await
+            {
+                tracing::debug!(
+                    ?e,
+                    ?foreign_network_name,
+                    ?foreign_peer_id,
+                    "foreign network mgr send_msg_to_peer failed"
+                );
+            }
+            Ok(())
+        } else if from_peer_id == my_peer_id {
+            // packet is generated from foreign network mgr and should be forward to other peer
+            if let Err(e) = peer_map
+                .send_msg(packet, to_peer_id, NextHopPolicy::LeastHop)
+                .await
+            {
+                tracing::debug!(
+                    ?e,
+                    ?to_peer_id,
+                    "send_msg_directly failed when forward local generated foreign network packet"
+                );
+            }
+
+            Ok(())
+        } else {
+            // target is not me, forward it
+            Err(packet)
+        }
+    }
+
     async fn start_peer_recv(&self) {
-        let mut recv = ReceiverStream::new(self.packet_recv.lock().await.take().unwrap());
+        let mut recv = self.packet_recv.lock().await.take().unwrap();
         let my_peer_id = self.my_peer_id;
         let peers = self.peers.clone();
         let pipe_line = self.peer_packet_process_pipeline.clone();
         let foreign_client = self.foreign_network_client.clone();
+        let foreign_mgr = self.foreign_network_manager.clone();
         let encryptor = self.encryptor.clone();
         self.tasks.lock().await.spawn(async move {
             tracing::trace!("start_peer_recv");
-            while let Some(mut ret) = recv.next().await {
+            while let Some(ret) = recv.recv().await {
+                let Err(mut ret) =
+                    Self::try_handle_foreign_network_packet(ret, my_peer_id, &peers, &foreign_mgr)
+                        .await
+                else {
+                    continue;
+                };
+
                 let Some(hdr) = ret.mut_peer_manager_header() else {
                     tracing::warn!(?ret, "invalid packet, skip");
                     continue;
                 };
+
                 tracing::trace!(?hdr, "peer recv a packet...");
                 let from_peer_id = hdr.from_peer_id.get();
                 let to_peer_id = hdr.to_peer_id.get();
@@ -463,6 +566,7 @@ impl PeerManager {
             my_peer_id: PeerId,
             peers: Weak<PeerMap>,
             foreign_network_client: Weak<ForeignNetworkClient>,
+            foreign_network_manager: Weak<ForeignNetworkManager>,
         }
 
         #[async_trait]
@@ -484,6 +588,37 @@ impl PeerManager {
             fn my_peer_id(&self) -> PeerId {
                 self.my_peer_id
             }
+
+            async fn list_foreign_networks(&self) -> ForeignNetworkRouteInfoMap {
+                let ret = DashMap::new();
+                let Some(foreign_mgr) = self.foreign_network_manager.upgrade() else {
+                    return ret;
+                };
+
+                let networks = foreign_mgr.list_foreign_networks().await;
+                for (network_name, info) in networks.foreign_networks.iter() {
+                    if info.peers.is_empty() {
+                        continue;
+                    }
+
+                    let last_update = foreign_mgr
+                        .get_foreign_network_last_update(network_name)
+                        .unwrap_or(SystemTime::now());
+                    ret.insert(
+                        ForeignNetworkRouteInfoKey {
+                            peer_id: self.my_peer_id,
+                            network_name: network_name.clone(),
+                        },
+                        ForeignNetworkRouteInfoEntry {
+                            foreign_peer_ids: info.peers.iter().map(|x| x.peer_id).collect(),
+                            last_update: Some(last_update.into()),
+                            version: 0,
+                            network_secret_digest: info.network_secret_digest.clone(),
+                        },
+                    );
+                }
+                ret
+            }
         }
 
         let my_peer_id = self.my_peer_id;
@@ -492,6 +627,7 @@ impl PeerManager {
                 my_peer_id,
                 peers: Arc::downgrade(&self.peers),
                 foreign_network_client: Arc::downgrade(&self.foreign_network_client),
+                foreign_network_manager: Arc::downgrade(&self.foreign_network_manager),
             }))
             .await
             .unwrap();
@@ -513,6 +649,28 @@ impl PeerManager {
 
     pub async fn dump_route(&self) -> String {
         self.get_route().dump().await
+    }
+
+    pub async fn list_global_foreign_network(&self) -> ListGlobalForeignNetworkResponse {
+        let mut resp = ListGlobalForeignNetworkResponse::default();
+        let ret = self.get_route().list_foreign_network_info().await;
+        for info in ret.infos.iter() {
+            let entry = resp
+                .foreign_networks
+                .entry(info.key.as_ref().unwrap().peer_id)
+                .or_insert_with(|| Default::default());
+
+            let mut f = OneForeignNetwork::default();
+            f.network_name = info.key.as_ref().unwrap().network_name.clone();
+            f.peer_ids
+                .extend(info.value.as_ref().unwrap().foreign_peer_ids.iter());
+            f.last_updated = format!("{}", info.value.as_ref().unwrap().last_update.unwrap());
+            f.version = info.value.as_ref().unwrap().version;
+
+            entry.foreign_networks.push(f);
+        }
+
+        resp
     }
 
     async fn run_nic_packet_process_pipeline(&self, data: &mut ZCPacket) {
@@ -560,8 +718,16 @@ impl PeerManager {
 
         let mut is_exit_node = false;
         let mut dst_peers = vec![];
-        // NOTE: currently we only support ipv4 and cidr is 24
-        if ipv4_addr.is_broadcast() || ipv4_addr.is_multicast() || ipv4_addr.octets()[3] == 255 {
+        let network_length = self
+            .global_ctx
+            .get_ipv4()
+            .map(|x| x.network_length())
+            .unwrap_or(24);
+        let ipv4_inet = cidr::Ipv4Inet::new(ipv4_addr, network_length).unwrap();
+        if ipv4_addr.is_broadcast()
+            || ipv4_addr.is_multicast()
+            || ipv4_addr == ipv4_inet.last_address()
+        {
             dst_peers.extend(
                 self.peers
                     .list_routes()
@@ -672,7 +838,6 @@ impl PeerManager {
             .await
             .replace(Arc::downgrade(&self.foreign_network_client));
 
-        self.foreign_network_manager.run().await;
         self.foreign_network_client.run().await;
     }
 
@@ -750,6 +915,7 @@ impl PeerManager {
                 .collect(),
             config: self.global_ctx.config.dump(),
             version: EASYTIER_VERSION.to_string(),
+            feature_flag: Some(self.global_ctx.get_feature_flags()),
         }
     }
 
@@ -900,7 +1066,7 @@ mod tests {
 
         let ret = stub
             .say_hello(
-                RpcController {},
+                RpcController::default(),
                 SayHelloRequest {
                     name: "abc".to_string(),
                 },

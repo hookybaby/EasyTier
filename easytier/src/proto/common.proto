@@ -42,6 +42,8 @@ message RpcPacket {
   int32 trace_id = 9;
 }
 
+message Void {}
+
 message UUID {
   uint64 high = 1;
   uint64 low = 2;
@@ -57,13 +59,22 @@ enum NatType {
   PortRestricted = 5;
   Symmetric = 6;
   SymUdpFirewall = 7;
+  SymmetricEasyInc = 8;
+  SymmetricEasyDec = 9;
 }
 
 message Ipv4Addr { uint32 addr = 1; }
 
 message Ipv6Addr {
-  uint64 high = 1;
-  uint64 low = 2;
+  uint32 part1 = 1;
+  uint32 part2 = 2;
+  uint32 part3 = 3;
+  uint32 part4 = 4;
+}
+
+message Ipv4Inet {
+  Ipv4Addr address = 1;
+  uint32 network_length = 2;
 }
 
 message Url { string url = 1; }
@@ -89,4 +100,9 @@ message StunInfo {
   repeated string public_ip = 4;
   uint32 min_port = 5;
   uint32 max_port = 6;
+}
+
+message PeerFeatureFlag {
+  bool is_public_server = 1;
+  bool no_relay_data = 2;
 }

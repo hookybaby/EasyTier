@@ -1,5 +1,7 @@
 use std::{fmt::Display, str::FromStr};
 
+use anyhow::Context;
+
 include!(concat!(env!("OUT_DIR"), "/common.rs"));
 
 impl From<uuid::Uuid> for Uuid {
@@ -45,19 +47,23 @@ impl From<std::net::Ipv6Addr> for Ipv6Addr {
     fn from(value: std::net::Ipv6Addr) -> Self {
         let b = value.octets();
         Self {
-            low: u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
-            high: u64::from_be_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]),
+            part1: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            part2: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            part3: u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
+            part4: u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
         }
     }
 }
 
 impl From<Ipv6Addr> for std::net::Ipv6Addr {
     fn from(value: Ipv6Addr) -> Self {
-        let low = value.low.to_be_bytes();
-        let high = value.high.to_be_bytes();
+        let part1 = value.part1.to_be_bytes();
+        let part2 = value.part2.to_be_bytes();
+        let part3 = value.part3.to_be_bytes();
+        let part4 = value.part4.to_be_bytes();
         std::net::Ipv6Addr::from([
-            low[0], low[1], low[2], low[3], low[4], low[5], low[6], low[7], high[0], high[1],
-            high[2], high[3], high[4], high[5], high[6], high[7],
+            part1[0], part1[1], part1[2], part1[3], part2[0], part2[1], part2[2], part2[3],
+            part3[0], part3[1], part3[2], part3[3], part4[0], part4[1], part4[2], part4[3],
         ])
     }
 }
@@ -65,6 +71,37 @@ impl From<Ipv6Addr> for std::net::Ipv6Addr {
 impl ToString for Ipv6Addr {
     fn to_string(&self) -> String {
         std::net::Ipv6Addr::from(self.clone()).to_string()
+    }
+}
+
+impl From<cidr::Ipv4Inet> for Ipv4Inet {
+    fn from(value: cidr::Ipv4Inet) -> Self {
+        Ipv4Inet {
+            address: Some(value.address().into()),
+            network_length: value.network_length() as u32,
+        }
+    }
+}
+
+impl From<Ipv4Inet> for cidr::Ipv4Inet {
+    fn from(value: Ipv4Inet) -> Self {
+        cidr::Ipv4Inet::new(value.address.unwrap().into(), value.network_length as u8).unwrap()
+    }
+}
+
+impl std::fmt::Display for Ipv4Inet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", cidr::Ipv4Inet::from(self.clone()))
+    }
+}
+
+impl FromStr for Ipv4Inet {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Ipv4Inet::from(
+            cidr::Ipv4Inet::from_str(s).with_context(|| "Failed to parse Ipv4Inet")?,
+        ))
     }
 }
 

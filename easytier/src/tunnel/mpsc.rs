@@ -7,11 +7,10 @@ use tokio::time::timeout;
 
 use crate::common::scoped_task::ScopedTask;
 
-use super::{
-    packet_def::ZCPacket, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream,
-};
+use super::{packet_def::ZCPacket, Tunnel, TunnelError, ZCPacketSink, ZCPacketStream};
 
-use tachyonix::{channel, Receiver, Sender};
+// use tokio::sync::mpsc::{channel, error::TrySendError, Receiver, Sender};
+use tachyonix::{channel, Receiver, Sender, TrySendError};
 
 use futures::SinkExt;
 
@@ -26,8 +25,8 @@ impl MpscTunnelSender {
 
     pub fn try_send(&self, item: ZCPacket) -> Result<(), TunnelError> {
         self.0.try_send(item).map_err(|e| match e {
-            tachyonix::TrySendError::Full(_) => TunnelError::BufferFull,
-            tachyonix::TrySendError::Closed(_) => TunnelError::Shutdown,
+            TrySendError::Full(_) => TunnelError::BufferFull,
+            TrySendError::Closed(_) => TunnelError::Shutdown,
         })
     }
 }
@@ -53,6 +52,7 @@ impl<T: Tunnel> MpscTunnel<T> {
                     break;
                 }
             }
+            rx.close();
             let close_ret = timeout(Duration::from_secs(5), sink.close()).await;
             tracing::warn!(?close_ret, "mpsc close sink");
         });
@@ -70,14 +70,32 @@ impl<T: Tunnel> MpscTunnel<T> {
         sink: &mut Pin<Box<dyn ZCPacketSink>>,
     ) -> Result<(), TunnelError> {
         let item = rx.recv().await.with_context(|| "recv error")?;
-        sink.feed(item).await?;
-        while let Ok(item) = rx.try_recv() {
-            if let Err(e) = sink.feed(item).await {
-                tracing::error!(?e, "feed error");
-                break;
+
+        match timeout(Duration::from_secs(10), async move {
+            sink.feed(item).await?;
+            while let Ok(item) = rx.try_recv() {
+                match sink.feed(item).await {
+                    Err(e) => {
+                        tracing::error!(?e, "feed error");
+                        return Err(e);
+                    }
+                    Ok(_) => {}
+                }
+            }
+            sink.flush().await
+        })
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                tracing::error!(?e, "forward error");
+                Err(e)
+            }
+            Err(e) => {
+                tracing::error!(?e, "forward timeout");
+                Err(e.into())
             }
         }
-        sink.flush().await
     }
 
     pub fn get_stream(&mut self) -> Pin<Box<dyn ZCPacketStream>> {

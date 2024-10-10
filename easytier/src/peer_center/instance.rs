@@ -65,7 +65,10 @@ impl PeerCenterBase {
         }
         // find peer with alphabetical smallest id.
         let mut min_peer = peer_mgr.my_peer_id();
-        for peer in peers.iter() {
+        for peer in peers
+            .iter()
+            .filter(|r| r.feature_flag.map(|r| !r.is_public_server).unwrap_or(true))
+        {
             let peer_id = peer.peer_id;
             if peer_id < min_peer {
                 min_peer = peer_id;
@@ -220,14 +223,14 @@ impl PeerCenterInstance {
                     .load()
                     .elapsed()
                     .as_secs()
-                    > 60
+                    > 120
                 {
                     ctx.job_ctx.global_peer_map_digest.store(Digest::default());
                 }
 
                 let ret = client
                     .get_global_peer_map(
-                        BaseController {},
+                        BaseController::default(),
                         GetGlobalPeerMapRequest {
                             digest: ctx.job_ctx.global_peer_map_digest.load(),
                         },
@@ -239,12 +242,12 @@ impl PeerCenterInstance {
                         "get global info from center server got error result: {:?}",
                         ret
                     );
-                    return Ok(1000);
+                    return Ok(10000);
                 };
 
                 if resp == GetGlobalPeerMapResponse::default() {
                     // digest match, no need to update
-                    return Ok(5000);
+                    return Ok(15000);
                 }
 
                 tracing::info!(
@@ -263,7 +266,7 @@ impl PeerCenterInstance {
                     .global_peer_map_update_time
                     .store(Instant::now());
 
-                Ok(5000)
+                Ok(15000)
             })
             .await;
     }
@@ -304,7 +307,7 @@ impl PeerCenterInstance {
 
                 let ret = client
                     .report_peers(
-                        BaseController {},
+                        BaseController::default(),
                         ReportPeersRequest {
                             my_peer_id: my_node_id,
                             peer_infos: Some(peers),
@@ -342,15 +345,22 @@ impl PeerCenterInstance {
             global_peer_map_update_time: Arc<AtomicCell<Instant>>,
         }
 
-        impl RouteCostCalculatorInterface for RouteCostCalculatorImpl {
-            fn calculate_cost(&self, src: PeerId, dst: PeerId) -> i32 {
-                let ret = self
-                    .global_peer_map_clone
+        impl RouteCostCalculatorImpl {
+            fn directed_cost(&self, src: PeerId, dst: PeerId) -> Option<i32> {
+                self.global_peer_map_clone
                     .map
                     .get(&src)
                     .and_then(|src_peer_info| src_peer_info.direct_peers.get(&dst))
-                    .and_then(|info| Some(info.latency_ms));
-                ret.unwrap_or(80)
+                    .and_then(|info| Some(info.latency_ms))
+            }
+        }
+
+        impl RouteCostCalculatorInterface for RouteCostCalculatorImpl {
+            fn calculate_cost(&self, src: PeerId, dst: PeerId) -> i32 {
+                if let Some(cost) = self.directed_cost(src, dst) {
+                    return cost;
+                }
+                self.directed_cost(dst, src).unwrap_or(100)
             }
 
             fn begin_update(&mut self) {
@@ -426,7 +436,7 @@ mod tests {
                     false
                 }
             },
-            Duration::from_secs(10),
+            Duration::from_secs(20),
         )
         .await;
 
@@ -435,7 +445,7 @@ mod tests {
             let rpc_service = pc.get_rpc_service();
             wait_for_condition(
                 || async { rpc_service.global_peer_map.read().unwrap().map.len() == 3 },
-                Duration::from_secs(10),
+                Duration::from_secs(20),
             )
             .await;
 

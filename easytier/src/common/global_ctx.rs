@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::proto::cli::PeerConnInfo;
+use crate::proto::common::PeerFeatureFlag;
 use crossbeam::atomic::AtomicCell;
 
 use super::{
@@ -39,8 +40,8 @@ pub enum GlobalCtxEvent {
     VpnPortalClientConnected(String, String), // (portal, client ip)
     VpnPortalClientDisconnected(String, String), // (portal, client ip)
 
-    DhcpIpv4Changed(Option<std::net::Ipv4Addr>, Option<std::net::Ipv4Addr>), // (old, new)
-    DhcpIpv4Conflicted(Option<std::net::Ipv4Addr>),
+    DhcpIpv4Changed(Option<cidr::Ipv4Inet>, Option<cidr::Ipv4Inet>), // (old, new)
+    DhcpIpv4Conflicted(Option<cidr::Ipv4Inet>),
 }
 
 type EventBus = tokio::sync::broadcast::Sender<GlobalCtxEvent>;
@@ -55,7 +56,7 @@ pub struct GlobalCtx {
 
     event_bus: EventBus,
 
-    cached_ipv4: AtomicCell<Option<std::net::Ipv4Addr>>,
+    cached_ipv4: AtomicCell<Option<cidr::Ipv4Inet>>,
     cached_proxy_cidrs: AtomicCell<Option<Vec<cidr::IpCidr>>>,
 
     ip_collector: Arc<IPCollector>,
@@ -68,6 +69,8 @@ pub struct GlobalCtx {
 
     enable_exit_node: bool,
     no_tun: bool,
+
+    feature_flags: AtomicCell<PeerFeatureFlag>,
 }
 
 impl std::fmt::Debug for GlobalCtx {
@@ -119,6 +122,8 @@ impl GlobalCtx {
 
             enable_exit_node,
             no_tun,
+
+            feature_flags: AtomicCell::new(PeerFeatureFlag::default()),
         }
     }
 
@@ -134,7 +139,7 @@ impl GlobalCtx {
         }
     }
 
-    pub fn get_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+    pub fn get_ipv4(&self) -> Option<cidr::Ipv4Inet> {
         if let Some(ret) = self.cached_ipv4.load() {
             return Some(ret);
         }
@@ -143,7 +148,7 @@ impl GlobalCtx {
         return addr;
     }
 
-    pub fn set_ipv4(&self, addr: Option<std::net::Ipv4Addr>) {
+    pub fn set_ipv4(&self, addr: Option<cidr::Ipv4Inet>) {
         self.config.set_ipv4(addr);
         self.cached_ipv4.store(None);
     }
@@ -222,6 +227,10 @@ impl GlobalCtx {
         self.config.get_flags()
     }
 
+    pub fn set_flags(&self, flags: Flags) {
+        self.config.set_flags(flags);
+    }
+
     pub fn get_128_key(&self) -> [u8; 16] {
         let mut key = [0u8; 16];
         let secret = self
@@ -245,6 +254,14 @@ impl GlobalCtx {
 
     pub fn no_tun(&self) -> bool {
         self.no_tun
+    }
+
+    pub fn get_feature_flags(&self) -> PeerFeatureFlag {
+        self.feature_flags.load()
+    }
+
+    pub fn set_feature_flags(&self, flags: PeerFeatureFlag) {
+        self.feature_flags.store(flags);
     }
 }
 
