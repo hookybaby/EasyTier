@@ -1,16 +1,15 @@
-import Aura from '@primevue/themes/aura'
-import PrimeVue from 'primevue/config'
-import ToastService from 'primevue/toastservice'
+import Aura from '@primeuix/themes/aura';
+import PrimeVue from 'primevue/config';
 
-import { createRouter, createWebHistory } from 'vue-router/auto'
-import { routes } from 'vue-router/auto-routes'
-import App from '~/App.vue'
-import { i18n, loadLanguageAsync } from '~/modules/i18n'
+import EasyTierFrontendLib, { I18nUtils } from 'easytier-frontend-lib';
+import { createRouter, createWebHistory } from 'vue-router/auto';
+import { routes } from 'vue-router/auto-routes';
+import App from '~/App.vue';
 
-import { getAutoLaunchStatusAsync, loadAutoLaunchStatusAsync } from './modules/auto_launch'
-import '~/styles.css'
-import 'primeicons/primeicons.css'
-import 'primeflex/primeflex.css'
+import 'easytier-frontend-lib/style.css';
+import { ConfirmationService, DialogService, ToastService } from 'primevue';
+import '~/styles.css';
+
 
 if (import.meta.env.PROD) {
   document.addEventListener('keydown', (event) => {
@@ -29,8 +28,7 @@ if (import.meta.env.PROD) {
 }
 
 async function main() {
-  await loadLanguageAsync(localStorage.getItem('lang') || 'en')
-  await loadAutoLaunchStatusAsync(getAutoLaunchStatusAsync())
+  await I18nUtils.loadLanguageAsync(localStorage.getItem('lang') || 'en')
 
   const app = createApp(App)
 
@@ -41,18 +39,24 @@ async function main() {
 
   app.use(router)
   app.use(createPinia())
-  app.use(i18n, { useScope: 'global' })
+  app.use(EasyTierFrontendLib)
+  // app.use(i18n, { useScope: 'global' })
   app.use(PrimeVue, {
     theme: {
       preset: Aura,
       options: {
         prefix: 'p',
         darkModeSelector: 'system',
-        cssLayer: false,
+        cssLayer: {
+          name: 'primevue',
+          order: 'tailwind-base, primevue, tailwind-utilities',
+        },
       },
     },
   })
   app.use(ToastService)
+  app.use(DialogService)
+  app.use(ConfirmationService)
   app.mount('#app')
 }
 

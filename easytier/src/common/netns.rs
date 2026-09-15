@@ -1,7 +1,8 @@
+use easytier_core::socket::SocketContext;
 use futures::Future;
 
 #[cfg(target_os = "linux")]
-use nix::sched::{setns, CloneFlags};
+use nix::sched::{CloneFlags, setns};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 
@@ -34,13 +35,12 @@ impl NetNSGuard {
             return;
         }
 
-        let ns_path: String;
         let name = name.unwrap();
-        if name == ROOT_NETNS_NAME {
-            ns_path = "/proc/1/ns/net".to_string();
+        let ns_path: String = if name == ROOT_NETNS_NAME {
+            "/proc/1/ns/net".to_string()
         } else {
-            ns_path = format!("/var/run/netns/{}", name);
-        }
+            format!("/var/run/netns/{}", name)
+        };
 
         let ns = std::fs::File::open(ns_path).unwrap();
         tracing::info!(
@@ -75,7 +75,7 @@ impl NetNSGuard {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NetNS {
     name: Option<String>,
 }
@@ -83,6 +83,15 @@ pub struct NetNS {
 impl NetNS {
     pub fn new(name: Option<String>) -> Self {
         NetNS { name }
+    }
+
+    pub fn from_socket_context(context: &SocketContext) -> Self {
+        Self::new(
+            context
+                .netns
+                .as_ref()
+                .map(|namespace| namespace.token().to_owned()),
+        )
     }
 
     pub async fn run_async<F, Fut, Ret>(&self, f: F) -> Ret

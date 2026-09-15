@@ -4,84 +4,54 @@
 			"path": "."
 		},
 		{
+			"name": "core",
+			"path": "easytier"
+		},
+		{
+			"name": "gui",
 			"path": "easytier-gui"
 		},
 		{
-			"path": "easytier"
+			"name": "web",
+			"path": "easytier-web"
+		},
+		{
+			"name": "ffi",
+			"path": "easytier-contrib/easytier-ffi"
+		},
+		{
+			"name": "magisk",
+			"path": "easytier-contrib/easytier-magisk"
+		},
+		{
+			"name": "openharmony",
+			"path": "easytier-contrib/easytier-ohrs"
+		},
+		{
+			"name": "uptime",
+			"path": "easytier-contrib/easytier-uptime"
+		},
+		{
+			"name": "vpnservice",
+			"path": "tauri-plugin-vpnservice"
+		},
+		{
+			"name": "rpc-build",
+			"path": "easytier-rpc-build"
 		}
 	],
 	"settings": {
-		"eslint.useFlatConfig": true,
+		"i18n-ally.sourceLanguage": "cn",
+		"i18n-ally.keystyle": "nested",
+		"i18n-ally.sortKeys": true,
+		// Disable the default formatter
 		"prettier.enable": false,
-		"editor.formatOnSave": false,
-		"editor.codeActionsOnSave": {
-			"source.fixAll.eslint": "explicit",
-			"source.organizeImports": "never"
+		"editor.formatOnSave": true,
+		"editor.formatOnSaveMode": "modifications",
+		"editor.formatOnPaste": false,
+		"editor.formatOnType": true,
+		"[nix]": {
+			"editor.formatOnSave": false,
 		},
-		"eslint.rules.customizations": [
-			{
-				"rule": "style/*",
-				"severity": "off"
-			},
-			{
-				"rule": "style/eol-last",
-				"severity": "error"
-			},
-			{
-				"rule": "format/*",
-				"severity": "off"
-			},
-			{
-				"rule": "*-indent",
-				"severity": "off"
-			},
-			{
-				"rule": "*-spacing",
-				"severity": "off"
-			},
-			{
-				"rule": "*-spaces",
-				"severity": "off"
-			},
-			{
-				"rule": "*-order",
-				"severity": "off"
-			},
-			{
-				"rule": "*-dangle",
-				"severity": "off"
-			},
-			{
-				"rule": "*-newline",
-				"severity": "off"
-			},
-			{
-				"rule": "*quotes",
-				"severity": "off"
-			},
-			{
-				"rule": "*semi",
-				"severity": "off"
-			}
-		],
-		"eslint.validate": [
-			"code-workspace",
-			"javascript",
-			"javascriptreact",
-			"typescript",
-			"typescriptreact",
-			"vue",
-			"html",
-			"markdown",
-			"json",
-			"jsonc",
-			"yaml",
-			"toml",
-			"gql",
-			"graphql"
-		],
-		"i18n-ally.localesPaths": [
-			"easytier-gui/locales"
-		]
 	}
 }
